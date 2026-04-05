@@ -446,30 +446,9 @@ def stitch_videos(video_paths, output_path, scroll=False, encoder_tuple=None):
         )
         return run_ffmpeg_progress(cmd, total_out_secs)
 
-    else:
-        # Try fast stream-copy concat first
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-            for p in video_paths:
-                # ffmpeg concat demuxer format: escape single quotes, strip newlines
-                safe_p = os.path.abspath(p).replace("\n", "").replace("\r", "").replace("'", "'\\''")
-                f.write(f"file '{safe_p}'\n")
-            list_file = f.name
-
-        cmd = [
-            "ffmpeg", "-fflags", "+genpts",  # Add this line
-            "-f", "concat", "-safe", "0",
-            "-i", list_file, "-c", "copy", "-y", output_path,
-        ]
-        try:
-            r = subprocess.run(cmd, stdout=subprocess.DEVNULL)
-        finally:
-            os.unlink(list_file)
-
-        if r.returncode == 0:
-            return True
-
-        # Fallback: re-encode with normalization (handles codec/resolution mismatches)
-        print("    ⚠️  Stream copy failed, re-encoding (this takes longer)...")
+        else:
+        # Skip stream-copy; re-encode directly to fix audio timestamp issues
+        print("    ⚠️  Re-encoding to fix audio timestamp issues...")
         inputs = []
         for p in video_paths:
             inputs += ["-i", p]
@@ -485,7 +464,7 @@ def stitch_videos(video_paths, output_path, scroll=False, encoder_tuple=None):
 
         total_out_secs = max(sum(durations), 0.1)
         cmd = (
-            ["ffmpeg", "-fflags", "+genpts"]  # ← ADD THIS LINE (changes this line)
+            ["ffmpeg", "-fflags", "+genpts"]
             + global_flags
             + inputs
             + ["-filter_complex", filtergraph,
