@@ -532,10 +532,13 @@ USAGE:
  SOURCE FLAGS (use one)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  --channel @handle
-    Pull shorts from a specific YouTube channel. Use the @ handle.
-    Structure:  --channel <@handle>
-    Example:    --channel @mkbhd
+  --channel @handle [...]
+    Pull shorts from one or more YouTube channels. Use the @ handle.
+    Pass multiple handles space-separated to mix channels together —
+    shorts will be interleaved evenly in the output.
+    Structure:  --channel <@handle> [<@handle> ...]
+    Examples:   --channel @mkbhd
+                --channel @mkbhd @linustechtips @veritasium
 
   --hashtag TAG
     Pull shorts from a YouTube hashtag page instead of a channel.
@@ -573,6 +576,13 @@ USAGE:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  OPTIONAL FLAGS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  --channels-per-short N
+    When using multiple --channel handles, cap how many shorts are
+    taken from each channel per run. Useful to keep the mix balanced
+    when one channel has way more shorts than another.
+    Structure:  --channels-per-short <integer>
+    Example:    --channel @mkbhd @linustechtips --count 20 --channels-per-short 10
 
   --quality QUALITY
     Resolution to download. Defaults to best available.
@@ -645,8 +655,11 @@ USAGE:
   # Exactly 15 shorts from @mkbhd, random order, scroll transitions
   python3 shortdl.py --channel @mkbhd --count 15 --order random --scroll --name mkbhd_mix
 
-  # 1 hour OR 20 shorts (whichever limit hits first), 720p, saved to ~/Videos
-  python3 shortdl.py --channel @mkbhd --duration 1h --count 20 --quality 720 --name mkbhd_mix -o ~/Videos
+  # Mix 3 channels — 30 shorts total, max 10 per channel
+  python3 shortdl.py --channel @mkbhd @linustechtips @veritasium --count 30 --channels-per-short 10 --name mixed_tech
+
+  # 1 hour of mixed content from 2 channels, 720p, saved to ~/Videos
+  python3 shortdl.py --channel @mkbhd @linustechtips --duration 1h --quality 720 --name tech_mix -o ~/Videos
 
   # 10 shorts tagged #cooking, newest first
   python3 shortdl.py --hashtag cooking --count 10 --name cooking_shorts
@@ -835,8 +848,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Download YouTube Shorts and stitch them into one video."
     )
-    parser.add_argument("--channel",   help="Channel handle, e.g. @mkbhd")
+    parser.add_argument("--channel",   nargs="+", help="One or more channel handles, e.g. --channel @mkbhd @linustechtips")
     parser.add_argument("--hashtag",   help="Hashtag to search, e.g. cooking or #funny")
+    parser.add_argument("--channels-per-short", type=int, default=None, metavar="N",
+                        help="Max shorts taken from each channel per run (multi-channel only)")
     parser.add_argument("--duration",  help="Target duration, e.g. 30m / 1h / 1h30m")
     parser.add_argument("--count",     type=int, help="Max number of shorts to download, e.g. 10")
     parser.add_argument("--name",      required=True,  help="Output filename (no extension), e.g. mkbhd_shorts")
@@ -853,15 +868,21 @@ def main():
     parser.add_argument("--venv",      help="Path to a venv containing yt-dlp, e.g. --venv ~/my_venv")
     args = parser.parse_args()
 
-    # Validate source: need exactly one of --channel or --hashtag
+    # ── Validate source ───────────────────────────────────────────────────────
     if not args.channel and not args.hashtag:
-        print("❌  You must provide either --channel @handle or --hashtag TAG.")
+        print("❌  You must provide either --channel @handle(s) or --hashtag TAG.")
         sys.exit(1)
     if args.channel and args.hashtag:
         print("❌  Use either --channel or --hashtag, not both.")
         sys.exit(1)
+    if args.hashtag and args.channels_per_short is not None:
+        print("❌  --channels-per-short only applies when using --channel with multiple channels.")
+        sys.exit(1)
+    if args.channels_per_short is not None and args.channels_per_short < 1:
+        print("❌  --channels-per-short must be a positive integer.")
+        sys.exit(1)
 
-    # Validate limit: need at least one of --duration or --count
+    # ── Validate limits ───────────────────────────────────────────────────────
     if args.count is not None and args.count < 1:
         print("❌  --count must be a positive integer (got 0 or negative).")
         sys.exit(1)
@@ -894,6 +915,13 @@ def main():
         print(f"⚠️   Name sanitized to: {safe_name}")
     output_path = out_dir / f"{safe_name}.mp4"
 
+    # Warn if output file already exists (ffmpeg would silently overwrite it)
+    if output_path.exists():
+        ans = input(f"⚠️   {output_path.name} already exists. Overwrite? [Y/n] ").strip().lower()
+        if ans == "n":
+            print("Aborted.")
+            sys.exit(0)
+
     target_seconds = parse_duration(args.duration) if args.duration else None
     if args.duration and not target_seconds:
         print("❌  Could not parse --duration. Use formats like 30m, 1h, 1h30m.")
@@ -910,7 +938,6 @@ def main():
                 limit_str += f"  |  Max shorts: {target_count}"
             print(f"\n📊  Estimated size: ~{est:.0f} MB  |  {limit_str}  |  Quality: {args.quality}")
         else:
-            # count-only mode: can't estimate size without a duration
             print(f"\n📊  Count limit: {target_count} short(s)  |  Quality: {args.quality}")
             print("    (Size estimate unavailable for count-only mode)")
         ans = input("    Continue? [Y/n] ").strip().lower()
@@ -921,65 +948,118 @@ def main():
     # Load history early so we can pass seen IDs into the smart fetcher
     history = load_history()
 
-    # Resolve source URL and history key
+    # ── Build list of (source_url, history_key) pairs ────────────────────────
     if args.hashtag:
         tag = args.hashtag.lstrip("#")
-        # Validate hashtag
         if not re.match(r'^[A-Za-z0-9_\-]{1,100}$', tag):
             print(f"❌  Invalid hashtag: {args.hashtag!r}")
             print("    Hashtags may only contain letters, numbers, underscores, and hyphens.")
             sys.exit(1)
-        source_url = f"https://www.youtube.com/hashtag/{tag}/shorts"
-        history_key = f"#{tag}"
-        print(f"\n🔍  Fetching shorts for #{tag}...")
+        sources = [(f"https://www.youtube.com/hashtag/{tag}/shorts", f"#{tag}")]
     else:
-        source_url = channel_url(args.channel)
-        history_key = args.channel.lstrip("@")
-        print(f"\n🔍  Fetching shorts from {args.channel}...")
+        sources = []
+        for ch in args.channel:
+            url = channel_url(ch)   # validates and exits on bad handle
+            key = ch.lstrip("@")
+            sources.append((url, key))
 
-    seen: set = set(history.get(history_key, []))
+    # ── Fetch candidate shorts from each source ───────────────────────────────
+    # For multi-channel we fetch per-source, respecting --channels-per-short,
+    # then interleave so the final list alternates between channels.
+    per_source_needed = None
+    if target_count:
+        if len(sources) == 1:
+            per_source_needed = target_count
+        else:
+            # With a per-channel cap, use that; otherwise spread evenly with headroom
+            if args.channels_per_short:
+                per_source_needed = args.channels_per_short
+            else:
+                # Fetch enough from each to comfortably fill the total
+                per_source_needed = max(target_count, 10)
 
-    # In count mode, pass `needed` so the fetcher stops early once it has enough
-    # entries. Always pass seen_ids (empty set when --no-history so batching still
-    # works correctly without falling back to a full-playlist scan).
-    shorts = fetch_shorts_list(
-        source_url,
-        after=args.after,
-        before=args.before,
-        order=args.order,
-        needed=target_count,
-        seen_ids=seen if not args.no_history else set(),
-    )
+    all_candidates = []   # flat interleaved list of shorts across sources
+    source_pools  = {}    # history_key → [shorts from that source]
 
-    if not shorts:
-        print("❌  No shorts found. Check the channel handle / hashtag and date filters.")
+    for source_url, history_key in sources:
+        seen_this = set(history.get(history_key, []))
+        label = f"#{history_key}" if history_key.startswith("#") else f"@{history_key}"
+        print(f"\n🔍  Fetching shorts from {label}...")
+        pool = fetch_shorts_list(
+            source_url,
+            after=args.after,
+            before=args.before,
+            order=args.order,
+            needed=per_source_needed,
+            seen_ids=seen_this if not args.no_history else set(),
+        )
+        if not pool:
+            print(f"    ⚠️  No shorts found for {label}, skipping.")
+            continue
+        print(f"    Found {len(pool)} shorts")
+        source_pools[history_key] = pool
+
+    if not source_pools:
+        print("❌  No shorts found from any source. Check handles / hashtag and date filters.")
         sys.exit(1)
-    print(f"    Found {len(shorts)} shorts")
 
-    # Skip already-seen
-    if args.no_history:
-        print("    ⚠️  History ignored — all shorts eligible for download")
-        new_shorts = shorts
+    # Interleave: round-robin across sources so the mix is even
+    if len(source_pools) == 1:
+        all_candidates = list(source_pools.values())[0]
     else:
-        new_shorts = [s for s in shorts if s["id"] not in seen]
-        skipped = len(shorts) - len(new_shorts)
+        pools = list(source_pools.values())
+        max_len = max(len(p) for p in pools)
+        for i in range(max_len):
+            for pool in pools:
+                if i < len(pool):
+                    all_candidates.append(pool[i])
+
+    # Apply global history filter
+    if args.no_history:
+        print("\n    ⚠️  History ignored — all shorts eligible for download")
+        new_shorts = all_candidates
+    else:
+        all_seen = set()
+        for history_key in source_pools:
+            all_seen.update(history.get(history_key, []))
+        new_shorts = [s for s in all_candidates if s["id"] not in all_seen]
+        skipped = len(all_candidates) - len(new_shorts)
         if skipped:
-            print(f"    Skipping {skipped} already-downloaded short(s)")
+            print(f"\n    Skipping {skipped} already-downloaded short(s)")
+
     if not new_shorts:
         print("⚠️   No new shorts to download.")
         sys.exit(0)
 
-    # Download loop
+    # ── Download loop ─────────────────────────────────────────────────────────
+    # Track per-source download counts for --channels-per-short enforcement
+    per_source_counts: dict[str, int] = {k: 0 for k in source_pools}
+    # Map video ID → history_key so we know which source to credit
+    id_to_source: dict[str, str] = {}
+    for hk, pool in source_pools.items():
+        for s in pool:
+            id_to_source[s["id"]] = hk
+    # Track seen per source for history saving
+    seen_per_source: dict[str, set] = {
+        hk: set(history.get(hk, [])) for hk in source_pools
+    }
+
     with tempfile.TemporaryDirectory() as tmpdir:
         downloaded = []
         total_seconds = 0.0
 
         for short in new_shorts:
-            # Check both limits — stop when whichever is set is reached
+            # Global limits
             if target_seconds is not None and total_seconds >= target_seconds:
                 break
             if target_count is not None and len(downloaded) >= target_count:
                 break
+
+            # Per-channel cap
+            src_key = id_to_source.get(short["id"])
+            if (args.channels_per_short is not None and src_key is not None
+                    and per_source_counts.get(src_key, 0) >= args.channels_per_short):
+                continue  # skip — this channel has hit its cap, keep looking
 
             title_preview = short["title"][:55]
             print(f"⬇️   {title_preview}...")
@@ -992,8 +1072,10 @@ def main():
                     continue
                 downloaded.append(path)
                 total_seconds += dur
-                seen.add(short["id"])
-                # Build progress label after updating counts so numbers are current
+                if src_key:
+                    per_source_counts[src_key] = per_source_counts.get(src_key, 0) + 1
+                    seen_per_source[src_key].add(short["id"])
+                # Build progress label
                 if target_seconds and target_count:
                     progress_suffix = f"{fmt_duration(total_seconds)} / {fmt_duration(target_seconds)}  |  {len(downloaded)}/{target_count} shorts"
                 elif target_seconds:
@@ -1008,13 +1090,17 @@ def main():
             print("❌  No shorts were downloaded successfully.")
             sys.exit(1)
 
+        def _save_all_history():
+            if args.no_history:
+                return
+            for hk, seen_set in seen_per_source.items():
+                history[hk] = list(seen_set)
+            save_history(history)
+
         # Not enough content? (only relevant when --duration is set)
         if target_seconds and total_seconds < target_seconds:
             print(f"\n⚠️   Only {fmt_duration(total_seconds)} of content available (wanted {fmt_duration(target_seconds)}).")
-            # Save history now so these shorts aren't re-downloaded even if user aborts
-            if not args.no_history:
-                history[history_key] = list(seen)
-                save_history(history)
+            _save_all_history()
             ans = input("    Stitch what we have anyway? [Y/n] ").strip().lower()
             if ans == "n":
                 print("Aborted. Progress saved — those shorts won't be re-downloaded.")
@@ -1029,9 +1115,7 @@ def main():
         if ok:
             size_mb = os.path.getsize(output_path) / (1024 * 1024)
             print(f"\n✅  Done!  →  {output_path}  ({size_mb:.1f} MB, {fmt_duration(total_seconds)}, {len(downloaded)} shorts)")
-            if not args.no_history:
-                history[history_key] = list(seen)
-                save_history(history)
+            _save_all_history()
         else:
             print("❌  Stitching failed. Check that ffmpeg is installed.")
             sys.exit(1)
