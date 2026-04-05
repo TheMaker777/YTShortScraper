@@ -456,7 +456,8 @@ def stitch_videos(video_paths, output_path, scroll=False, encoder_tuple=None):
             list_file = f.name
 
         cmd = [
-            "ffmpeg", "-f", "concat", "-safe", "0",
+            "ffmpeg", "-fflags", "+genpts",  # Add this line
+            "-f", "concat", "-safe", "0",
             "-i", list_file, "-c", "copy", "-y", output_path,
         ]
         try:
@@ -484,7 +485,7 @@ def stitch_videos(video_paths, output_path, scroll=False, encoder_tuple=None):
 
         total_out_secs = max(sum(durations), 0.1)
         cmd = (
-            ["ffmpeg"]
+            ["ffmpeg", "-fflags", "+genpts"]  # ← ADD THIS LINE (changes this line)
             + global_flags
             + inputs
             + ["-filter_complex", filtergraph,
